@@ -1,148 +1,147 @@
-/* 
-    A boilerplate for typical LoRa applications, built with libraries that work fine for me.
-    This code is a working example that creates some random sensor values.
-*/
-#include <Arduino.h>
-#include "config.h"
+#include "LoRaWan_APP.h"
+#include "Arduino.h"
 #include "deviceConfig.h"
-#include "LoraTinyLoRa.h"       // TinyLora Wrapper, could be replaced by other LoRa implementation
-#include <CayenneLPP.h>
-#include <FSM.h>
-#include "RandomDataSensor.h"
-#include "VoltageSensor.h"
-#include "Debug.h"
+#include "CayenneLPP.h"
 
-#ifdef FEATHERM0
-  #include <Adafruit_SleepyDog.h>
-#endif
+/*
+ * set LoraWan_RGB to Active,the RGB active in loraWan
+ * RGB red means sending;
+ * RGB purple means joined done;
+ * RGB blue means RxWindow1;
+ * RGB yellow means RxWindow2;
+ * RGB green means received done;
+ */
 
-// Alternatively choose other LoRa Implementation from the modular-lora framework
-// Global Variables required for TinyLoRa ABP
-uint8_t NwkSkey[16] = NWKSKEY;  // TTN Network Session Key
-uint8_t AppSkey[16] = APPSKEY;  // TTN Application Session Key
-uint8_t DevAddr[4] = DEVADDR;   // TTN Device Adress
-LoraTinyLoRa lora;
+/* OTAA para*/
+uint8_t devEui[] = { 0x70, 0xB3, 0xD5, 0x7E, 0xD0, 0x06, 0xA6, 0xD7 };
+uint8_t appEui[] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+uint8_t appKey[] = { 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x66, 0x01 };
 
-// Any other playoad format coudl be use, currently we like CayenneLPP
-CayenneLPP payload(22);         // Buffer for the LoRa payload.
+/* ABP para*/
+uint8_t nwkSKey[] = NWKSKEY;
+uint8_t appSKey[] = APPSKEY;
+uint32_t devAddr =  ( uint32_t ) DEVADDR;
+ 
+/*LoraWan channelsmask, default channels 0-7*/ 
+uint16_t userChannelsMask[6]={ 0x00FF,0x0000,0x0000,0x0000,0x0000,0x0000 };
 
-const int C_SEND_INTERVAL {SEND_INTERVAL}; // Interval for sending the data to the cloud in seconds
-const int C_OBSERVATION_INTERVAL {OBSERVATION_INTERVAL}; // Interval for observing the sensors
-const int numObservationsTillSend {C_SEND_INTERVAL/C_OBSERVATION_INTERVAL}; // Number of sensor intervals before sending out the data
-int sleepCounter {0};   // counts the how many times the watchdogSleep or simulateSleep was called
+/*LoraWan region, select in arduino IDE tools*/
+LoRaMacRegion_t loraWanRegion = ACTIVE_REGION;
 
-/* Define Statemachine: States, Functions, Events, Transiitions */
-/* Function prototypes */
-void observe();
-void send();
-void sleep();
+/*LoraWan Class, Class A and Class C are supported*/
+DeviceClass_t  loraWanClass = LORAWAN_CLASS;
 
-/* States
-                     Enter  State     Exit  */
-State stateSleeping  (NULL,  &sleep ,  NULL);
-State stateObserving (NULL,  &observe, NULL);
-State stateSending   (NULL,  &send,    NULL);
-State stateFinished  (NULL,  NULL,     NULL);
-Fsm fsm(&stateSleeping);
+/*the application data transmission duty cycle.  value in [ms].*/
+uint32_t appTxDutyCycle = 1000*15; //60*30; // 30 minutes
 
-/* Events */
-enum Event{
-  WAKEUP,       // Imediate Wake up (e.g. on interupt)
-  SLEEP,        // Sleep and try to save energy
-  SEND,         // Send the payload out over LoRa Network aber a numeber of obervations (could also be triggerd by time)
-  FINISH        // For debugging we want to stop the program and do nothing after sending out over LoRa (keep the device from beeing blocked)
-};
+/*OTAA or ABP*/
+bool overTheAirActivation = LORAWAN_NETMODE;
 
-/* Transitions */
-void defineFSMTransitions () {
-  fsm.add_transition(&stateSleeping,  &stateObserving, Event::WAKEUP, NULL);
-  fsm.add_transition(&stateObserving, &stateSleeping,  Event::SLEEP,  NULL);
-  fsm.add_transition(&stateObserving, &stateSending,   Event::SEND,   NULL);
-  fsm.add_transition(&stateSending,   &stateSleeping,  Event::SLEEP,  NULL);
-  fsm.add_transition(&stateSending,   &stateFinished,  Event::FINISH, NULL);
+/*ADR enable*/
+bool loraWanAdr = LORAWAN_ADR;
+
+/* set LORAWAN_Net_Reserve ON, the node could save the network info to flash, when node reset not need to join again */
+bool keepNet = LORAWAN_NET_RESERVE;
+
+/* Indicates if the node is sending confirmed or unconfirmed messages */
+bool isTxConfirmed = LORAWAN_UPLINKMODE;
+
+/* Application port */
+uint8_t appPort = 2;
+/*!
+* Number of trials to transmit the frame, if the LoRaMAC layer did not
+* receive an acknowledgment. The MAC performs a datarate adaptation,
+* according to the LoRaWAN Specification V1.0.2, chapter 18.4, according
+* to the following table:
+*
+* Transmission nb | Data Rate
+* ----------------|-----------
+* 1 (first)       | DR
+* 2               | DR
+* 3               | max(DR-1,0)
+* 4               | max(DR-1,0)
+* 5               | max(DR-2,0)
+* 6               | max(DR-2,0)
+* 7               | max(DR-3,0)
+* 8               | max(DR-3,0)
+*
+* Note, that if NbTrials is set to 1 or 2, the MAC will not decrease
+* the datarate, in case the LoRaMAC layer did not receive an acknowledgment
+*/
+uint8_t confirmedNbTrials = 4;
+
+/* Prepares the payload of the frame */
+static void prepareTxFrame( uint8_t port )
+{
+	/*appData size is LORAWAN_APP_DATA_MAX_SIZE which is defined in "commissioning.h".
+	*appDataSize max value is LORAWAN_APP_DATA_MAX_SIZE.
+	*if enabled AT, don't modify LORAWAN_APP_DATA_MAX_SIZE, it may cause system hanging or failure.
+	*if disabled AT, LORAWAN_APP_DATA_MAX_SIZE can be modified, the max value is reference to lorawan region and SF.
+	*for example, if use REGION_CN470, 
+	*the max value for different DR can be found in MaxPayloadOfDatarateCN470 refer to DataratesCN470 and BandwidthsCN470 in "RegionCN470.h".
+	*/
+    CayenneLPP lpp(LORAWAN_APP_DATA_MAX_SIZE);
+    lpp.addTemperature(1, 23.3);
+    lpp.addRelativeHumidity(1, 45.2);
+    lpp.getBuffer(), 
+    appDataSize = lpp.getSize();
+    memcpy(appData,lpp.getBuffer(),appDataSize);
 }
 
-/* end of define state machine */
 
-/* Declare Sensors  */
-RandomDataSensor temperature {10,30};
-RandomDataSensor humiditiy {40,80};
-VoltageSensor batteryVoltage {VBATPIN, REFVOL};
-
-/* observe all sensors and process their data accoring to their sensor class implementation */
-void observe() {
-  debug("Start observing...");
-  temperature.measure();
-  humiditiy.measure();
-  batteryVoltage.measure();
-  debugLn(" end ");
-  if (sleepCounter < numObservationsTillSend) {
-    fsm.trigger(Event::SLEEP);
-  } else {
-    fsm.trigger(Event::SEND);
-  }
-}
-/* Sleep implementation accoring to the platform */
-/* This function is used to set the watchdog timer to sleep between the observation invervals.*/
-
-#if defined(FEATHERM0) && !defined(DEBUG)
-void sleep(){
-  Watchdog.reset();
-  Watchdog.sleep(C_OBSERVATION_INTERVAL*1000); //sleeptime in ms  
-  sleepCounter++;
-  fsm.trigger(Event::WAKEUP);
-}
-#else
-/* This function simulates sleep. But the mikrocontroller doesn't enter sleepmode, so the serial communication doesn't break down.*/
-void sleep(){
-  debug("Start sleeping... ");
-  delay(C_OBSERVATION_INTERVAL*1000);
-  sleepCounter++;
-  debugLn("wake up");
-  fsm.trigger(Event::WAKEUP);
-}
-#endif
-
-/* Prepare the payload and send over LoRa */
-void send() {
-  payload.reset();
-  payload.addTemperature(1, temperature.getValue().avg);
-  payload.addTemperature(2, temperature.getValue().min);
-  payload.addTemperature(3, temperature.getValue().max);
-  payload.addRelativeHumidity(4, humiditiy.getValue().avg/100);
-  payload.addVoltage(5, batteryVoltage.getValue().avg);
-
-  digitalWrite(LED_BUILTIN, HIGH);
-  debugLn("Sending LoRa Data...");
-  lora.send(payload.getBuffer(), payload.getSize());
-  delay(1000);
-  digitalWrite(LED_BUILTIN, LOW);
-
-  temperature.reset();
-  humiditiy.reset();
-  batteryVoltage.reset();
-  sleepCounter = 0;
-  #ifdef DEBUG // For debuging only send once to prevent the device from beeing blocked by TTN
-    if (lora.getFrameCounter() > 1) {
-      fsm.trigger(Event::FINISH);
-    } else {
-      fsm.trigger(Event::SLEEP);
-    }
-  #else
-    fsm.trigger(Event::SLEEP);
-  #endif
+void setup() {
+	boardInitMcu();
+	Serial.begin(9600);
+    #if(AT_SUPPORT)
+	    enableAt();
+    #endif
+	deviceState = DEVICE_STATE_INIT;
+	LoRaWAN.ifskipjoin();
 }
 
-void setup() {  
-  #ifdef DEBUG
-    Serial.begin(9600);
-    while (! Serial);
-    debugLn("Serial started");
-  #endif 
-  lora.begin(DATARATE, MULTI);
-  defineFSMTransitions();
-}
-
-void loop() {
-  fsm.run_machine();
+void loop()
+{
+	switch( deviceState )
+	{
+		case DEVICE_STATE_INIT:
+		{
+            #if(AT_SUPPORT)
+			    getDevParam();
+            #endif
+			printDevParam();
+			LoRaWAN.init(loraWanClass,loraWanRegion);
+			deviceState = DEVICE_STATE_JOIN;
+			break;
+		}
+		case DEVICE_STATE_JOIN:
+		{
+			LoRaWAN.join();
+			break;
+		}
+		case DEVICE_STATE_SEND:
+		{
+			prepareTxFrame( appPort );
+			LoRaWAN.send();
+			deviceState = DEVICE_STATE_CYCLE;
+			break;
+		}
+		case DEVICE_STATE_CYCLE:
+		{
+			// Schedule next packet transmission
+			txDutyCycleTime = appTxDutyCycle + randr( 0, APP_TX_DUTYCYCLE_RND );
+			LoRaWAN.cycle(txDutyCycleTime);
+			deviceState = DEVICE_STATE_SLEEP;
+			break;
+		}
+		case DEVICE_STATE_SLEEP:
+		{
+			LoRaWAN.sleep();
+			break;
+		}
+		default:
+		{
+			deviceState = DEVICE_STATE_INIT;
+			break;
+		}
+	}
 }
