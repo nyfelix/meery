@@ -38,7 +38,7 @@ LoRaMacRegion_t loraWanRegion = ACTIVE_REGION;
 DeviceClass_t  loraWanClass = LORAWAN_CLASS;
 
 /*the application data transmission duty cycle.  value in [ms].*/
-uint32_t appTxDutyCycle = 20*60*1000; // 30 minutes
+uint32_t appTxDutyCycle = 60*60*1000; // 30 minutes
 
 uint32_t cyclesToSend = 1; //60*30; // 30 minutes
 
